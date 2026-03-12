@@ -475,7 +475,8 @@ class RayPPOTrainer:
             AdvantageEstimator.REMAX,
             AdvantageEstimator.RLOO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
-            AdvantageEstimator.GiGPO
+            AdvantageEstimator.GiGPO,
+            AdvantageEstimator.VRC
         ]:
             self.use_critic = False
         else:
