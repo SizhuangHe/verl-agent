@@ -473,8 +473,9 @@ def compute_vrc_advantage(
                 id2out_mean[idx] = torch.tensor(0.0)
                 id2out_std[idx] = torch.tensor(1.0)
             else:
-                id2out_mean[idx] = torch.mean(torch.tensor(scores))
-                id2out_std[idx] = torch.std(torch.tensor([scores]))
+                stacked = torch.stack([s.detach() for s in scores])
+                id2out_mean[idx] = stacked.mean()
+                id2out_std[idx] = stacked.std()
 
         # Compute per-group stats for checkpoint
         id2ckpt_mean, id2ckpt_std = {}, {}
@@ -484,8 +485,9 @@ def compute_vrc_advantage(
                 id2ckpt_mean[idx] = torch.tensor(0.0)
                 id2ckpt_std[idx] = torch.tensor(1.0)
             else:
-                id2ckpt_mean[idx] = torch.mean(torch.tensor(scores))
-                id2ckpt_std[idx] = torch.std(torch.tensor([scores]))
+                stacked = torch.stack([s.detach() for s in scores])
+                id2ckpt_mean[idx] = stacked.mean()
+                id2ckpt_std[idx] = stacked.std()
 
         # Normalize and blend
         blended = torch.zeros(bsz, dtype=torch.float32, device=token_level_rewards.device)
@@ -511,16 +513,14 @@ def compute_vrc_advantage(
     vrc_metrics = {}
     with torch.no_grad():
         # Per-predicate hit rates across all trajectories
-        from vrc.checkpoint_reward import compute_checkpoint_reward
-        from vrc.predicates_webshop import CHECKPOINT_PREDICATES
-        all_hit_counts = [0] * len(CHECKPOINT_PREDICATES)
+        all_hit_counts = [0] * len(checkpoint_predicates)
         n_trajs = len(traj_to_steps)
         for traj_id, step_indices in traj_to_steps.items():
             obs_list = [anchor_obs[i] for i in step_indices if isinstance(anchor_obs[i], str)]
-            for p_idx, pred_fn in enumerate(CHECKPOINT_PREDICATES):
+            for p_idx, pred_fn in enumerate(checkpoint_predicates):
                 if any(pred_fn(obs) for obs in obs_list):
                     all_hit_counts[p_idx] += 1
-        for p_idx in range(len(CHECKPOINT_PREDICATES)):
+        for p_idx in range(len(checkpoint_predicates)):
             vrc_metrics[f'vrc/P{p_idx+1}_rate'] = all_hit_counts[p_idx] / max(n_trajs, 1)
 
         # Checkpoint reward stats
@@ -534,11 +534,11 @@ def compute_vrc_advantage(
         ckpt_std_in_all_fail = []
         for idx in id2outcome:
             scores = id2outcome[idx]
-            if all(s == 0 for s in scores):
+            if all(float(s) == 0 for s in scores):
                 n_all_fail += 1
                 ckpt_vals = id2ckpt[idx]
                 if len(ckpt_vals) > 1:
-                    ckpt_std_in_all_fail.append(float(torch.std(torch.tensor(ckpt_vals))))
+                    ckpt_std_in_all_fail.append(float(torch.stack(ckpt_vals).std()))
         vrc_metrics['vrc/all_fail_group_ratio'] = n_all_fail / max(n_groups, 1)
         vrc_metrics['vrc/ckpt_std_in_all_fail'] = (
             sum(ckpt_std_in_all_fail) / len(ckpt_std_in_all_fail) if ckpt_std_in_all_fail else 0.0
