@@ -363,7 +363,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         if multi_turn:
             response_length = grpo_calculation_mask.size(1)
             grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
-        advantages, returns = core_algos.compute_vrc_advantage(
+        advantages, returns, vrc_metrics = core_algos.compute_vrc_advantage(
             token_level_rewards=data.batch['token_level_rewards'],
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch['uid'],
@@ -376,6 +376,11 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+        # Store VRC metrics for wandb logging
+        if not hasattr(data, 'vrc_metrics'):
+            data.vrc_metrics = vrc_metrics
+        else:
+            data.vrc_metrics.update(vrc_metrics)
     else:
         raise NotImplementedError
     return data
@@ -1279,6 +1284,10 @@ class RayPPOTrainer:
                             vrc_checkpoint_mode=self.config.algorithm.vrc.checkpoint_mode,
                             vrc_predicates=vrc_predicates,
                         )
+
+                    # Log VRC metrics if available
+                    if hasattr(batch, 'vrc_metrics'):
+                        metrics.update(batch.vrc_metrics)
 
                     # update critic
                     if self.use_critic:

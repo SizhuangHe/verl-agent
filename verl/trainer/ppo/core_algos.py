@@ -507,7 +507,44 @@ def compute_vrc_advantage(
 
         advantages = blended.unsqueeze(-1) * response_mask
 
-    return advantages, advantages
+    # --- 4. Compute VRC diagnostics for logging ---
+    vrc_metrics = {}
+    with torch.no_grad():
+        # Per-predicate hit rates across all trajectories
+        from vrc.checkpoint_reward import compute_checkpoint_reward
+        from vrc.predicates_webshop import CHECKPOINT_PREDICATES
+        all_hit_counts = [0] * len(CHECKPOINT_PREDICATES)
+        n_trajs = len(traj_to_steps)
+        for traj_id, step_indices in traj_to_steps.items():
+            obs_list = [anchor_obs[i] for i in step_indices if isinstance(anchor_obs[i], str)]
+            for p_idx, pred_fn in enumerate(CHECKPOINT_PREDICATES):
+                if any(pred_fn(obs) for obs in obs_list):
+                    all_hit_counts[p_idx] += 1
+        for p_idx in range(len(CHECKPOINT_PREDICATES)):
+            vrc_metrics[f'vrc/P{p_idx+1}_rate'] = all_hit_counts[p_idx] / max(n_trajs, 1)
+
+        # Checkpoint reward stats
+        all_ckpt = list(traj_to_ckpt_reward.values())
+        vrc_metrics['vrc/checkpoint_reward_mean'] = sum(all_ckpt) / max(len(all_ckpt), 1)
+        vrc_metrics['vrc/checkpoint_reward_std'] = float(torch.std(torch.tensor(all_ckpt))) if len(all_ckpt) > 1 else 0.0
+
+        # All-fail group analysis (core VRC value proposition)
+        n_groups = len(id2outcome)
+        n_all_fail = 0
+        ckpt_std_in_all_fail = []
+        for idx in id2outcome:
+            scores = id2outcome[idx]
+            if all(s == 0 for s in scores):
+                n_all_fail += 1
+                ckpt_vals = id2ckpt[idx]
+                if len(ckpt_vals) > 1:
+                    ckpt_std_in_all_fail.append(float(torch.std(torch.tensor(ckpt_vals))))
+        vrc_metrics['vrc/all_fail_group_ratio'] = n_all_fail / max(n_groups, 1)
+        vrc_metrics['vrc/ckpt_std_in_all_fail'] = (
+            sum(ckpt_std_in_all_fail) / len(ckpt_std_in_all_fail) if ckpt_std_in_all_fail else 0.0
+        )
+
+    return advantages, advantages, vrc_metrics
 
 
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
