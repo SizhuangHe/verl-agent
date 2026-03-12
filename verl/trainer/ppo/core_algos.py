@@ -387,6 +387,129 @@ def compute_remax_outcome_advantage(token_level_rewards: torch.Tensor, reward_ba
     return advantages, returns
 
 
+def compute_vrc_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    traj_index: np.ndarray,
+    anchor_obs: np.ndarray,
+    checkpoint_predicates: list,
+    alpha: float = 1.0,
+    checkpoint_mode: str = "gated",
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+):
+    """
+    Compute VRC advantage: outcome advantage + alpha * checkpoint advantage.
+
+    Advantage-level blending of outcome (sparse) and checkpoint (dense) rewards.
+    Each stream is normalized independently within each prompt group before combining.
+
+    Key edge case: when ALL rollouts in a group fail (outcome std=0),
+    A_outcome is all zeros but A_checkpoint still provides gradient signal.
+
+    Args:
+        token_level_rewards: (bs, response_length) — outcome rewards on last token
+        response_mask: (bs, response_length)
+        index: (bs,) — prompt group IDs
+        traj_index: (bs,) — trajectory IDs (steps share traj_uid)
+        anchor_obs: (bs,) — observation text at each step
+        checkpoint_predicates: ordered list of predicate functions
+        alpha: blending weight for checkpoint advantage
+        checkpoint_mode: "gated" or "unordered"
+        epsilon: numerical stability constant
+        norm_adv_by_std_in_grpo: whether to normalize by std (True=GRPO, False=Dr.GRPO)
+
+    Returns:
+        advantages: (bs, response_length)
+        returns: (bs, response_length)
+    """
+    from vrc.checkpoint_reward import compute_checkpoint_reward
+
+    bsz = token_level_rewards.shape[0]
+
+    # --- 1. Compute outcome scores (same as standard GRPO) ---
+    outcome_scores = token_level_rewards.sum(dim=-1)  # (bs,)
+
+    # --- 2. Compute checkpoint rewards per trajectory ---
+    # Group observations by traj_uid to reconstruct trajectories
+    traj_to_steps = defaultdict(list)
+    for i in range(bsz):
+        traj_to_steps[traj_index[i]].append(i)
+
+    # Compute one checkpoint reward per trajectory
+    traj_to_ckpt_reward = {}
+    for traj_id, step_indices in traj_to_steps.items():
+        obs_list = [anchor_obs[i] for i in step_indices if isinstance(anchor_obs[i], str)]
+        if obs_list:
+            ckpt_r = compute_checkpoint_reward(obs_list, checkpoint_predicates, mode=checkpoint_mode)
+        else:
+            ckpt_r = 0.0
+        traj_to_ckpt_reward[traj_id] = ckpt_r
+
+    # Assign checkpoint reward to each step
+    ckpt_scores = torch.zeros(bsz, dtype=torch.float32, device=token_level_rewards.device)
+    for i in range(bsz):
+        ckpt_scores[i] = traj_to_ckpt_reward[traj_index[i]]
+
+    # --- 3. Normalize each stream within prompt groups ---
+    id2outcome = defaultdict(list)
+    id2ckpt = defaultdict(list)
+    seen_pairs = set()
+
+    with torch.no_grad():
+        for i in range(bsz):
+            if (index[i], traj_index[i]) in seen_pairs:
+                continue
+            id2outcome[index[i]].append(outcome_scores[i])
+            id2ckpt[index[i]].append(ckpt_scores[i])
+            seen_pairs.add((index[i], traj_index[i]))
+
+        # Compute per-group stats for outcome
+        id2out_mean, id2out_std = {}, {}
+        for idx in id2outcome:
+            scores = id2outcome[idx]
+            if len(scores) == 1:
+                id2out_mean[idx] = torch.tensor(0.0)
+                id2out_std[idx] = torch.tensor(1.0)
+            else:
+                id2out_mean[idx] = torch.mean(torch.tensor(scores))
+                id2out_std[idx] = torch.std(torch.tensor([scores]))
+
+        # Compute per-group stats for checkpoint
+        id2ckpt_mean, id2ckpt_std = {}, {}
+        for idx in id2ckpt:
+            scores = id2ckpt[idx]
+            if len(scores) == 1:
+                id2ckpt_mean[idx] = torch.tensor(0.0)
+                id2ckpt_std[idx] = torch.tensor(1.0)
+            else:
+                id2ckpt_mean[idx] = torch.mean(torch.tensor(scores))
+                id2ckpt_std[idx] = torch.std(torch.tensor([scores]))
+
+        # Normalize and blend
+        blended = torch.zeros(bsz, dtype=torch.float32, device=token_level_rewards.device)
+        for i in range(bsz):
+            idx = index[i]
+            # Outcome advantage
+            if norm_adv_by_std_in_grpo:
+                a_out = (outcome_scores[i] - id2out_mean[idx]) / (id2out_std[idx] + epsilon)
+            else:
+                a_out = outcome_scores[i] - id2out_mean[idx]
+
+            # Checkpoint advantage
+            if norm_adv_by_std_in_grpo:
+                a_ckpt = (ckpt_scores[i] - id2ckpt_mean[idx]) / (id2ckpt_std[idx] + epsilon)
+            else:
+                a_ckpt = ckpt_scores[i] - id2ckpt_mean[idx]
+
+            blended[i] = a_out + alpha * a_ckpt
+
+        advantages = blended.unsqueeze(-1) * response_mask
+
+    return advantages, advantages
+
+
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     kl = old_log_prob - ref_log_prob
     return token_level_scores - kl * kl_ratio

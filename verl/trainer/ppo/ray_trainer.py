@@ -94,6 +94,7 @@ class AdvantageEstimator(str, Enum):
     RLOO = "rloo"
     GRPO_PASSK = "grpo_passk"
     GiGPO = 'gigpo'
+    VRC = 'vrc'
 
 
 @dataclass
@@ -241,7 +242,7 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, **kwargs):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, vrc_alpha=1.0, vrc_checkpoint_mode="gated", vrc_predicates=None, **kwargs):
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -357,6 +358,24 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.VRC:
+        grpo_calculation_mask = data.batch["response_mask"]
+        if multi_turn:
+            response_length = grpo_calculation_mask.size(1)
+            grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
+        advantages, returns = core_algos.compute_vrc_advantage(
+            token_level_rewards=data.batch['token_level_rewards'],
+            response_mask=grpo_calculation_mask,
+            index=data.non_tensor_batch['uid'],
+            traj_index=data.non_tensor_batch['traj_uid'],
+            anchor_obs=data.non_tensor_batch['anchor_obs'],
+            checkpoint_predicates=vrc_predicates,
+            alpha=vrc_alpha,
+            checkpoint_mode=vrc_checkpoint_mode,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
     else:
         raise NotImplementedError
     return data
@@ -459,6 +478,24 @@ class RayPPOTrainer:
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+        # Cache VRC predicates if using VRC advantage estimator
+        self._vrc_predicates_cache = None
+
+    def _get_vrc_predicates(self):
+        """Load and cache VRC checkpoint predicates based on environment name."""
+        if self._vrc_predicates_cache is not None:
+            return self._vrc_predicates_cache
+
+        env_name = self.config.env.env_name.lower()
+        if env_name == "webshop":
+            from vrc.predicates_webshop import get_webshop_checkpoints
+            self._vrc_predicates_cache = get_webshop_checkpoints()
+        else:
+            raise ValueError(f"VRC predicates not implemented for environment: {env_name}")
+
+        print(f"[VRC] Loaded {len(self._vrc_predicates_cache)} checkpoint predicates for {env_name}")
+        return self._vrc_predicates_cache
 
     def _validate_config(self):
         config = self.config
@@ -1218,6 +1255,11 @@ class RayPPOTrainer:
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
 
+                        # Load VRC predicates if needed
+                        vrc_predicates = None
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.VRC:
+                            vrc_predicates = self._get_vrc_predicates()
+
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1233,6 +1275,9 @@ class RayPPOTrainer:
                             gigpo_mode=self.config.algorithm.gigpo.mode,
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                            vrc_alpha=self.config.algorithm.vrc.alpha,
+                            vrc_checkpoint_mode=self.config.algorithm.vrc.checkpoint_mode,
+                            vrc_predicates=vrc_predicates,
                         )
 
                     # update critic
