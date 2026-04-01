@@ -428,16 +428,23 @@ def compute_vrc_advantage(
 
     bsz = token_level_rewards.shape[0]
 
-    # --- 1. Compute outcome scores (same as standard GRPO) ---
-    outcome_scores = token_level_rewards.sum(dim=-1)  # (bs,)
-
-    # --- 2. Compute checkpoint rewards per trajectory ---
-    # Group observations by traj_uid to reconstruct trajectories
+    # --- 1. Group steps by trajectory ---
     traj_to_steps = defaultdict(list)
     for i in range(bsz):
         traj_to_steps[traj_index[i]].append(i)
 
-    # Compute one checkpoint reward per trajectory
+    # --- 2. Compute trajectory-level outcome scores ---
+    # token_level_rewards is step-level; outcome reward only appears on terminal step.
+    # Must aggregate across all steps to get the true trajectory outcome.
+    step_scores = token_level_rewards.sum(dim=-1)  # (bs,) per-step scores
+    traj_outcome = {}
+    for traj_id, step_indices in traj_to_steps.items():
+        traj_outcome[traj_id] = sum(step_scores[i] for i in step_indices)
+    outcome_scores = torch.zeros(bsz, dtype=torch.float32, device=token_level_rewards.device)
+    for i in range(bsz):
+        outcome_scores[i] = traj_outcome[traj_index[i]]
+
+    # --- 3. Compute trajectory-level checkpoint rewards ---
     traj_to_ckpt_reward = {}
     for traj_id, step_indices in traj_to_steps.items():
         obs_list = [anchor_obs[i] for i in step_indices if isinstance(anchor_obs[i], str)]
@@ -447,12 +454,11 @@ def compute_vrc_advantage(
             ckpt_r = 0.0
         traj_to_ckpt_reward[traj_id] = ckpt_r
 
-    # Assign checkpoint reward to each step
     ckpt_scores = torch.zeros(bsz, dtype=torch.float32, device=token_level_rewards.device)
     for i in range(bsz):
         ckpt_scores[i] = traj_to_ckpt_reward[traj_index[i]]
 
-    # --- 3. Normalize each stream within prompt groups ---
+    # --- 4. Normalize each stream within prompt groups ---
     id2outcome = defaultdict(list)
     id2ckpt = defaultdict(list)
     seen_pairs = set()
@@ -500,8 +506,11 @@ def compute_vrc_advantage(
                 a_out = outcome_scores[i] - id2out_mean[idx]
 
             # Checkpoint advantage
+            # Clamp minimum std to prevent explosion when all rollouts have
+            # near-identical checkpoint scores (e.g., all ckpt_reward ≈ 1.0)
             if norm_adv_by_std_in_grpo:
-                a_ckpt = (ckpt_scores[i] - id2ckpt_mean[idx]) / (id2ckpt_std[idx] + epsilon)
+                ckpt_std_safe = max(id2ckpt_std[idx], 0.1)
+                a_ckpt = (ckpt_scores[i] - id2ckpt_mean[idx]) / ckpt_std_safe
             else:
                 a_ckpt = ckpt_scores[i] - id2ckpt_mean[idx]
 

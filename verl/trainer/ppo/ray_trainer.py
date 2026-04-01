@@ -489,18 +489,46 @@ class RayPPOTrainer:
         self._vrc_predicates_cache = None
 
     def _get_vrc_predicates(self):
-        """Load and cache VRC checkpoint predicates based on environment name."""
+        """Load and cache VRC checkpoint predicates based on environment name and predicate version."""
         if self._vrc_predicates_cache is not None:
             return self._vrc_predicates_cache
 
         env_name = self.config.env.env_name.lower()
+        version = getattr(self.config.algorithm.vrc, 'predicate_version', 'original')
+
         if env_name == "webshop":
-            from vrc.predicates_webshop import get_webshop_checkpoints
-            self._vrc_predicates_cache = get_webshop_checkpoints()
+            version_to_module = {
+                "original": "vrc.predicates_webshop",
+                "mixed": "vrc.predicates_webshop_mixed",
+                "success_only": "vrc.predicates_webshop_success_only",
+                "failures_only": "vrc.predicates_webshop_failures_only",
+                "mixed_fine": "vrc.predicates_webshop_mixed_fine",
+                "success_only_fine": "vrc.predicates_webshop_success_only_fine",
+                "failures_only_fine": "vrc.predicates_webshop_failures_only_fine",
+            }
+            module_name = version_to_module.get(version)
+            if module_name is None:
+                raise ValueError(f"Unknown VRC predicate version: {version}. Choose from: {list(version_to_module.keys())}")
+
+            import importlib
+            module = importlib.import_module(module_name)
+            self._vrc_predicates_cache = module.get_webshop_checkpoints()
+        elif "alfworld" in env_name:
+            version_to_module = {
+                "original": "vrc.predicates_alfworld",
+                "success_only": "vrc.predicates_alfworld_success_only",
+            }
+            module_name = version_to_module.get(version)
+            if module_name is None:
+                raise ValueError(f"Unknown VRC predicate version for ALFWorld: {version}. Choose from: {list(version_to_module.keys())}")
+
+            import importlib
+            module = importlib.import_module(module_name)
+            self._vrc_predicates_cache = module.get_checkpoints()
         else:
             raise ValueError(f"VRC predicates not implemented for environment: {env_name}")
 
-        print(f"[VRC] Loaded {len(self._vrc_predicates_cache)} checkpoint predicates for {env_name}")
+        print(f"[VRC] Loaded {len(self._vrc_predicates_cache)} checkpoint predicates for {env_name} (version={version})")
         return self._vrc_predicates_cache
 
     def _validate_config(self):
@@ -704,6 +732,55 @@ class RayPPOTrainer:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    def _dump_trajectories(self, batch, dump_path):
+        """Dump trajectory-level data (anchor_obs, active_masks, rewards, traj_uid) for VRC predicate generation."""
+        from collections import defaultdict
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"trajectories_{self.global_steps}.json")
+
+        ntb = batch.non_tensor_batch
+        # Check required fields exist
+        if 'anchor_obs' not in ntb or 'traj_uid' not in ntb:
+            print(f"Skipping trajectory dump: missing anchor_obs or traj_uid")
+            return
+
+        anchor_obs = ntb['anchor_obs']
+        traj_uid = ntb['traj_uid']
+        active_masks = ntb.get('active_masks', None)
+        rewards = ntb.get('rewards', None)
+        is_action_valid = ntb.get('is_action_valid', None)
+
+        # Decode model responses
+        outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+
+        # Group steps by trajectory
+        traj_to_steps = defaultdict(list)
+        for i in range(len(traj_uid)):
+            traj_to_steps[str(traj_uid[i])].append(i)
+
+        trajectories = []
+        for tid, step_indices in traj_to_steps.items():
+            steps = []
+            for idx in step_indices:
+                step = {
+                    "observation": str(anchor_obs[idx]) if anchor_obs[idx] is not None else None,
+                    "model_response": outputs[idx],
+                    "active_masks": bool(active_masks[idx]) if active_masks is not None else True,
+                    "reward": float(rewards[idx]) if rewards is not None else 0.0,
+                    "is_action_valid": bool(is_action_valid[idx]) if is_action_valid is not None else None,
+                }
+                steps.append(step)
+            trajectories.append({
+                "traj_uid": tid,
+                "num_steps": len(steps),
+                "trajectory": steps,
+            })
+
+        with open(filename, "w") as f:
+            json.dump(trajectories, f, indent=2, ensure_ascii=False)
+
+        print(f"Dumped {len(trajectories)} trajectories to {filename}")
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1321,6 +1398,8 @@ class RayPPOTrainer:
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir,
                             )
+                            # Dump trajectory data (anchor_obs, active_masks, etc.) for VRC predicate generation
+                            self._dump_trajectories(batch, dump_path=rollout_data_dir)
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
