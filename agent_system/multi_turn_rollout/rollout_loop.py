@@ -178,6 +178,7 @@ class TrajectoryCollector:
             'position_ids': position_ids[0],
             'raw_prompt_ids': raw_prompt_ids,
             'anchor_obs': _obs_anchor,
+            'obs_content': obs_content,  # MTSD: pre-chat-template prompt text for teacher conditioning
             'index': item,
             'data_source': data_source
         })
@@ -386,6 +387,13 @@ class TrajectoryCollector:
             assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
             batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
             batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
+
+            # MTSD: store raw next observation for teacher prompt conditioning
+            next_obs_anchor = next_obs.get('anchor', None)
+            if next_obs_anchor is not None:
+                batch.non_tensor_batch['next_obs_text'] = np.array(next_obs_anchor, dtype=object)
+            else:
+                batch.non_tensor_batch['next_obs_text'] = np.array([None] * batch_size, dtype=object)
             
             # Update episode lengths for active environments
             batch_list: list[dict] = to_list_of_dict(batch)

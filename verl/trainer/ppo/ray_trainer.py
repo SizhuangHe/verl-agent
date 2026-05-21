@@ -531,6 +531,95 @@ class RayPPOTrainer:
         print(f"[VRC] Loaded {len(self._vrc_predicates_cache)} checkpoint predicates for {env_name} (version={version})")
         return self._vrc_predicates_cache
 
+    # ---- MTSD: teacher suffix for next-observation conditioning ----
+    MTSD_TEACHER_SUFFIX = "\n\nAfter taking your action, the environment responded: {next_observation}"
+
+    def _build_teacher_batch(self, batch: DataProto) -> DataProto:
+        """Build a teacher-conditioned batch for MTSD Δ_t computation.
+
+        For each step, teacher prompt = obs_content + TEACHER_SUFFIX(next_obs_text),
+        wrapped in a chat template, then concatenated with the same response tokens.
+        Steps without next_obs_text (terminal) get the original prompt (Δ_t = 0).
+
+        Returns a DataProto with the same responses but teacher-conditioned input_ids.
+        """
+        import verl.utils.torch_functional as verl_F
+        from verl.utils.model import compute_position_id_with_mask
+
+        obs_contents = batch.non_tensor_batch['obs_content']
+        next_obs_texts = batch.non_tensor_batch['next_obs_text']
+        responses = batch.batch['responses']  # (bs, resp_len)
+        bs = responses.shape[0]
+        resp_len = responses.shape[1]
+
+        apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+        max_prompt_length = self.config.data.max_prompt_length
+
+        all_input_ids = []
+        all_attention_mask = []
+
+        for i in range(bs):
+            obs_content_i = obs_contents[i]
+            next_obs_i = next_obs_texts[i]
+
+            # Build teacher content: append next observation if available
+            if next_obs_i is not None and isinstance(next_obs_i, str) and len(next_obs_i) > 0:
+                teacher_content = obs_content_i + self.MTSD_TEACHER_SUFFIX.format(next_observation=next_obs_i)
+            else:
+                # Terminal step or missing next_obs: use original prompt (Δ=0)
+                teacher_content = obs_content_i
+
+            # Apply chat template
+            chat = [{"content": teacher_content, "role": "user"}]
+            teacher_prompt_str = self.tokenizer.apply_chat_template(
+                chat,
+                add_generation_prompt=True,
+                tokenize=False,
+                **apply_chat_template_kwargs,
+            )
+
+            # Tokenize teacher prompt
+            teacher_prompt_ids = self.tokenizer(teacher_prompt_str, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
+
+            # Truncate prompt if too long (left truncation to keep recent context)
+            if len(teacher_prompt_ids) > max_prompt_length:
+                teacher_prompt_ids = teacher_prompt_ids[-max_prompt_length:]
+
+            # Concatenate: teacher_prompt + response
+            response_ids = responses[i]  # (resp_len,)
+            full_ids = torch.cat([teacher_prompt_ids, response_ids], dim=0)
+            mask = torch.ones(len(full_ids), dtype=torch.long)
+
+            all_input_ids.append(full_ids)
+            all_attention_mask.append(mask)
+
+        # Left-pad all sequences to the same length
+        max_len = max(ids.shape[0] for ids in all_input_ids)
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+
+        padded_input_ids = torch.full((bs, max_len), pad_token_id, dtype=torch.long)
+        padded_attention_mask = torch.zeros((bs, max_len), dtype=torch.long)
+
+        for i in range(bs):
+            seq_len = all_input_ids[i].shape[0]
+            pad_len = max_len - seq_len
+            padded_input_ids[i, pad_len:] = all_input_ids[i]
+            padded_attention_mask[i, pad_len:] = all_attention_mask[i]
+
+        # Position IDs from attention mask
+        padded_position_ids = compute_position_id_with_mask(padded_attention_mask)
+
+        # Build teacher DataProto with same responses (needed for log_prob indexing)
+        teacher_data = DataProto.from_dict(
+            tensors={
+                "input_ids": padded_input_ids,
+                "attention_mask": padded_attention_mask,
+                "position_ids": padded_position_ids,
+                "responses": responses,
+            },
+        )
+        return teacher_data
+
     def _validate_config(self):
         config = self.config
         # number of GPUs total
@@ -1294,6 +1383,59 @@ class RayPPOTrainer:
                                 }
                             )
 
+                    # MTSD: teacher forward pass + Δ_t computation
+                    if self.config.algorithm.get('mtsd', {}).get('enable', False):
+                        with _timer("teacher_log_prob", timing_raw):
+                            teacher_batch = self._build_teacher_batch(batch)
+                            # Carry meta_info needed by compute_log_prob
+                            teacher_batch.meta_info = {
+                                "eos_token_id": self.tokenizer.eos_token_id,
+                                "pad_token_id": self.tokenizer.pad_token_id,
+                                "recompute_log_prob": False,
+                            }
+                            teacher_result = self.actor_rollout_wg.compute_log_prob(teacher_batch)
+                            batch.batch["teacher_log_probs"] = teacher_result.batch["old_log_probs"]
+
+                        with _timer("mtsd_delta", timing_raw):
+                            mtsd_cfg = self.config.algorithm.mtsd
+                            response_mask = batch.batch["response_mask"]
+
+                            # Per-step log_prob sums (sum over response tokens per step)
+                            student_lp = (batch.batch["old_log_probs"] * response_mask).sum(dim=-1)  # (bs,)
+                            teacher_lp = (batch.batch["teacher_log_probs"] * response_mask).sum(dim=-1)  # (bs,)
+                            delta_t = teacher_lp - student_lp  # (bs,), both computed with no_grad
+
+                            # Per-trajectory z-score normalization (§5b)
+                            traj_uids = batch.non_tensor_batch['traj_uid']
+                            delta_normalized = torch.zeros_like(delta_t)
+                            for uid in np.unique(traj_uids):
+                                mask = np.array(traj_uids) == uid
+                                d = delta_t[mask]
+                                if d.numel() > 1:
+                                    delta_normalized[mask] = (d - d.mean()) / (d.std() + 1e-8)
+                                # else: single step trajectory → delta_normalized stays 0 → w=1
+
+                            # Weight: w = clip(exp(λ·Δ̃), 1-ε, 1+ε)
+                            lam = mtsd_cfg.get('lambda_', 0.5)
+                            eps = mtsd_cfg.get('epsilon', 0.2)
+                            w_t = torch.clamp(torch.exp(lam * delta_normalized), 1.0 - eps, 1.0 + eps)
+
+                            # Store for advantage reweighting (broadcast to token level)
+                            # w_t is per-step (bs,), broadcast across response tokens
+                            batch.batch["mtsd_weights"] = w_t.unsqueeze(-1).expand_as(response_mask) * response_mask
+
+                            # Log metrics
+                            metrics.update({
+                                "mtsd/delta_mean": delta_t.mean().item(),
+                                "mtsd/delta_std": delta_t.std().item(),
+                                "mtsd/delta_norm_mean": delta_normalized.mean().item(),
+                                "mtsd/delta_norm_std": delta_normalized.std().item(),
+                                "mtsd/w_mean": w_t.mean().item(),
+                                "mtsd/w_std": w_t.std().item(),
+                                "mtsd/w_min": w_t.min().item(),
+                                "mtsd/w_max": w_t.max().item(),
+                            })
+
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer("ref", timing_raw):
@@ -1362,6 +1504,11 @@ class RayPPOTrainer:
                             vrc_checkpoint_mode=self.config.algorithm.vrc.checkpoint_mode,
                             vrc_predicates=vrc_predicates,
                         )
+
+                    # MTSD: multiply advantage by per-step weight w(Δ_t)
+                    # w_t > 0 always (exp + clip), so sign of A_grpo is never flipped
+                    if "mtsd_weights" in batch.batch:
+                        batch.batch["advantages"] = batch.batch["advantages"] * batch.batch["mtsd_weights"]
 
                     # Log VRC metrics if available
                     if hasattr(batch, 'vrc_metrics'):
