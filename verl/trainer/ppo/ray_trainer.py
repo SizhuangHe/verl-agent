@@ -620,6 +620,143 @@ class RayPPOTrainer:
         )
         return teacher_data
 
+    # ---- HCAPO: hindsight conditioning constants ----
+    HCAPO_FRAME_PREFIX = (
+        "[Hindsight] Looking back on the full episode after it ended, the "
+        "trajectory unfolded as follows. "
+    )
+    HCAPO_OUTCOME_SUCCESS = "Ultimately, the task was completed successfully."
+    HCAPO_OUTCOME_FAILURE = "Ultimately, the task ended in failure."
+    HCAPO_T_TEMP = 5.0        # Temperature sharpening for π_hind (Eq. 6)
+    HCAPO_C_MIN = 0.8         # Clip range for ρ_t (Eq. 7)
+    HCAPO_C_MAX = 1.2
+    HCAPO_RECAP_CHAR_BUDGET = 4000
+
+    def _build_sfinal_map(self, batch: DataProto) -> dict:
+        """Build s_final suffix for each trajectory in the batch.
+
+        Groups steps by traj_uid, reconstructs a compact trajectory recap
+        (action→observation per step), appends outcome banner.
+
+        Returns: dict mapping traj_uid → s_final string.
+        """
+        traj_uids = batch.non_tensor_batch['traj_uid']
+        next_obs_texts = batch.non_tensor_batch['next_obs_text']
+        responses = batch.batch['responses']
+        episode_rewards = batch.non_tensor_batch.get('episode_rewards', None)
+
+        # Group step indices by trajectory
+        traj_steps = {}
+        for i, uid in enumerate(traj_uids):
+            uid_str = str(uid)
+            if uid_str not in traj_steps:
+                traj_steps[uid_str] = []
+            traj_steps[uid_str].append(i)
+
+        sfinal_map = {}
+        for uid_str, indices in traj_steps.items():
+            # Determine outcome from episode_rewards (ALFWorld: 10=success, 0=fail)
+            if episode_rewards is not None:
+                success = float(episode_rewards[indices[0]]) > 0
+            else:
+                success = False
+
+            # Build trajectory recap: decode actions, pair with next_obs
+            lines = []
+            for step_num, idx in enumerate(indices, 1):
+                action_text = self.tokenizer.decode(
+                    responses[idx][responses[idx] != self.tokenizer.pad_token_id],
+                    skip_special_tokens=True,
+                ).strip()
+                obs_text = next_obs_texts[idx]
+                if action_text:
+                    obs_str = str(obs_text) if obs_text is not None else ""
+                    lines.append(f"Step {step_num}: action='{action_text}' → observation='{obs_str}'")
+
+            recap = " | ".join(lines)
+            if len(recap) > self.HCAPO_RECAP_CHAR_BUDGET:
+                recap = "... [earlier steps truncated] ... " + recap[-(self.HCAPO_RECAP_CHAR_BUDGET - 40):]
+
+            outcome_banner = self.HCAPO_OUTCOME_SUCCESS if success else self.HCAPO_OUTCOME_FAILURE
+            sfinal = "\n\n" + self.HCAPO_FRAME_PREFIX + recap + " " + outcome_banner
+            sfinal_map[uid_str] = (sfinal, success)
+
+        return sfinal_map
+
+    def _build_hcapo_teacher_batch(self, batch: DataProto) -> DataProto:
+        """Build HCAPO teacher-conditioned batch using s_final (full hindsight).
+
+        Same structure as _build_teacher_batch but appends s_final instead of
+        next_obs_text. For failed trajectories, s_final is still built (needed
+        for log_prob computation) but the do-no-harm mask zeros them out later.
+        """
+        from verl.utils.model import compute_position_id_with_mask
+
+        sfinal_map = self._build_sfinal_map(batch)
+
+        obs_contents = batch.non_tensor_batch['obs_content']
+        traj_uids = batch.non_tensor_batch['traj_uid']
+        responses = batch.batch['responses']
+        bs = responses.shape[0]
+
+        apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+        max_prompt_length = self.config.data.max_prompt_length
+
+        all_input_ids = []
+        all_attention_mask = []
+
+        for i in range(bs):
+            uid_str = str(traj_uids[i])
+            sfinal, _ = sfinal_map[uid_str]
+            teacher_content = obs_contents[i] + sfinal
+
+            chat = [{"content": teacher_content, "role": "user"}]
+            teacher_prompt_str = self.tokenizer.apply_chat_template(
+                chat,
+                add_generation_prompt=True,
+                tokenize=False,
+                **apply_chat_template_kwargs,
+            )
+
+            teacher_prompt_ids = self.tokenizer(
+                teacher_prompt_str, return_tensors="pt", add_special_tokens=False
+            )["input_ids"][0]
+
+            if len(teacher_prompt_ids) > max_prompt_length:
+                teacher_prompt_ids = teacher_prompt_ids[-max_prompt_length:]
+
+            response_ids = responses[i]
+            full_ids = torch.cat([teacher_prompt_ids, response_ids], dim=0)
+            mask = torch.ones(len(full_ids), dtype=torch.long)
+
+            all_input_ids.append(full_ids)
+            all_attention_mask.append(mask)
+
+        # Left-pad
+        max_len = max(ids.shape[0] for ids in all_input_ids)
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+
+        padded_input_ids = torch.full((bs, max_len), pad_token_id, dtype=torch.long)
+        padded_attention_mask = torch.zeros((bs, max_len), dtype=torch.long)
+
+        for i in range(bs):
+            seq_len = all_input_ids[i].shape[0]
+            pad_len = max_len - seq_len
+            padded_input_ids[i, pad_len:] = all_input_ids[i]
+            padded_attention_mask[i, pad_len:] = all_attention_mask[i]
+
+        padded_position_ids = compute_position_id_with_mask(padded_attention_mask)
+
+        teacher_data = DataProto.from_dict(
+            tensors={
+                "input_ids": padded_input_ids,
+                "attention_mask": padded_attention_mask,
+                "position_ids": padded_position_ids,
+                "responses": responses,
+            },
+        )
+        return teacher_data, sfinal_map
+
     def _validate_config(self):
         config = self.config
         # number of GPUs total
@@ -1434,6 +1571,60 @@ class RayPPOTrainer:
                                 "mtsd/w_std": w_t.std().item(),
                                 "mtsd/w_min": w_t.min().item(),
                                 "mtsd/w_max": w_t.max().item(),
+                            })
+
+                    # HCAPO: hindsight teacher forward pass + ρ_t computation
+                    if self.config.algorithm.get('hcapo', {}).get('enable', False):
+                        with _timer("hcapo_teacher_log_prob", timing_raw):
+                            hcapo_teacher_batch, sfinal_map = self._build_hcapo_teacher_batch(batch)
+                            hcapo_teacher_batch.meta_info = {
+                                "eos_token_id": self.tokenizer.eos_token_id,
+                                "pad_token_id": self.tokenizer.pad_token_id,
+                                "recompute_log_prob": False,
+                            }
+                            hcapo_teacher_result = self.actor_rollout_wg.compute_log_prob(hcapo_teacher_batch)
+                            batch.batch["hcapo_teacher_log_probs"] = hcapo_teacher_result.batch["old_log_probs"]
+
+                        with _timer("hcapo_rho", timing_raw):
+                            response_mask = batch.batch["response_mask"]
+                            traj_uids = batch.non_tensor_batch['traj_uid']
+                            bs = response_mask.shape[0]
+
+                            # Per-step: student sum-logprob, teacher mean-logprob / T_temp
+                            student_lp_sum = (batch.batch["old_log_probs"] * response_mask).sum(dim=-1)  # (bs,)
+                            hcapo_lp = batch.batch["hcapo_teacher_log_probs"] * response_mask  # (bs, resp_len)
+                            n_tokens = response_mask.sum(dim=-1).clamp(min=1)  # (bs,)
+                            hcapo_lp_mean_T = hcapo_lp.sum(dim=-1) / n_tokens / self.HCAPO_T_TEMP  # (bs,)
+
+                            # ρ_t = exp(mean_lp_hind/T - sum_lp_student) — asymmetric (Eq. 6)
+                            rho_t = torch.exp(hcapo_lp_mean_T - student_lp_sum)  # (bs,)
+                            rho_clipped = torch.clamp(rho_t, self.HCAPO_C_MIN, self.HCAPO_C_MAX)
+
+                            # Do-no-harm: G = 1 for success, 0 for failure
+                            G = torch.zeros(bs, device=rho_clipped.device)
+                            for i in range(bs):
+                                uid_str = str(traj_uids[i])
+                                _, success = sfinal_map[uid_str]
+                                G[i] = 1.0 if success else 0.0
+
+                            # HCAPO weight = clip(ρ) * G
+                            w_hcapo = rho_clipped * G  # (bs,)
+
+                            # Store for advantage reweighting (broadcast to token level)
+                            batch.batch["mtsd_weights"] = w_hcapo.unsqueeze(-1).expand_as(response_mask) * response_mask
+
+                            # Log metrics
+                            n_succ = G.sum().item()
+                            n_fail = bs - n_succ
+                            metrics.update({
+                                "hcapo/rho_mean": rho_t.mean().item(),
+                                "hcapo/rho_std": rho_t.std().item(),
+                                "hcapo/rho_clipped_mean": rho_clipped.mean().item(),
+                                "hcapo/w_mean": w_hcapo.mean().item(),
+                                "hcapo/w_std": w_hcapo.std().item(),
+                                "hcapo/n_success_steps": n_succ,
+                                "hcapo/n_failure_steps": n_fail,
+                                "hcapo/G_mean": G.mean().item(),
                             })
 
                     if self.use_reference_policy:
