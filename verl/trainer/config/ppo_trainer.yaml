@@ -255,6 +255,7 @@ algorithm:
   vrc:
     alpha: 1.0 # blending weight for checkpoint advantage: A = A_out + alpha * A_ckpt
     checkpoint_mode: "gated" # "gated" (anti-reward-hacking) or "unordered" (ablation)
+    predicate_version: "mixed" # "mixed", "success_only", "failures_only", "mixed_fine", "success_only_fine", "failures_only_fine", or "original"
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10

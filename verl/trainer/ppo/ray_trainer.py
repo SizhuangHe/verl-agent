@@ -1542,8 +1542,31 @@ class RayPPOTrainer:
                             teacher_lp = (batch.batch["teacher_log_probs"] * response_mask).sum(dim=-1)  # (bs,)
                             delta_t = teacher_lp - student_lp  # (bs,), both computed with no_grad
 
-                            # Per-trajectory z-score normalization (§5b)
+                            # MTSD-random negative control: shuffle delta within each trajectory
+                            # Preserves per-trajectory marginal distribution, destroys step alignment
                             traj_uids = batch.non_tensor_batch['traj_uid']
+                            if mtsd_cfg.get('shuffle_delta', False):
+                                traj_uids_arr = np.array(traj_uids)
+                                diag = (self.global_steps == 0)  # log diagnostics on first step
+                                n_diag = 0
+                                for uid in np.unique(traj_uids_arr):
+                                    indices = np.where(traj_uids_arr == uid)[0]
+                                    if len(indices) > 1:
+                                        pre = delta_t[indices].clone()
+                                        perm = torch.randperm(len(indices), device=delta_t.device)
+                                        delta_t[indices] = pre[perm]
+                                        if diag and n_diag < 3:
+                                            post = delta_t[indices]
+                                            print(
+                                                f"[MTSD-shuffle] traj={uid} n={len(indices)} "
+                                                f"pre={pre.tolist()} post={post.tolist()} "
+                                                f"mean_eq={pre.mean().item():.8f}=={post.mean().item():.8f} "
+                                                f"std_eq={pre.std().item():.8f}=={post.std().item():.8f} "
+                                                f"multiset_ok={sorted(pre.tolist())==sorted(post.tolist())}"
+                                            )
+                                            n_diag += 1
+
+                            # Per-trajectory z-score normalization (§5b)
                             delta_normalized = torch.zeros_like(delta_t)
                             for uid in np.unique(traj_uids):
                                 mask = np.array(traj_uids) == uid
@@ -1571,6 +1594,7 @@ class RayPPOTrainer:
                                 "mtsd/w_std": w_t.std().item(),
                                 "mtsd/w_min": w_t.min().item(),
                                 "mtsd/w_max": w_t.max().item(),
+                                "mtsd/shuffle_delta": 1.0 if mtsd_cfg.get('shuffle_delta', False) else 0.0,
                             })
 
                     # HCAPO: hindsight teacher forward pass + ρ_t computation

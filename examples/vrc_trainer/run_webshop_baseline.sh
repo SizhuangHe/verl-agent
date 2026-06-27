@@ -6,7 +6,7 @@ export VLLM_ATTENTION_BACKEND=XFORMERS
 num_cpus_per_env_worker=0.1
 
 # --- Binary GRPO baseline (no checkpoint reward) ---
-train_data_size=16
+train_data_size=${TRAIN_DATA_SIZE:-16}
 val_data_size=128
 group_size=8
 

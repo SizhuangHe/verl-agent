@@ -98,7 +98,7 @@ def check_purchase_completed(observation: str) -> bool:
     Adaptation: case-insensitive check.
     """
     obs = observation.lower()
-    return "thank you for shopping with us!" in obs and "purchased" in obs
+    return "thank you for shopping with us!" in obs
 
 
 # ============================================================================
