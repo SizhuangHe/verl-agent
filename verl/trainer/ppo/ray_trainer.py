@@ -1575,14 +1575,26 @@ class RayPPOTrainer:
                                     delta_normalized[mask] = (d - d.mean()) / (d.std() + 1e-8)
                                 # else: single step trajectory → delta_normalized stays 0 → w=1
 
-                            # Weight: w = clip(exp(λ·Δ̃), 1-ε, 1+ε)
+                            # Weight: w = clip(exp(λ·Δ̃), 1-ε, 1+ε)  (always computed for logging)
                             lam = mtsd_cfg.get('lambda_', 0.5)
                             eps = mtsd_cfg.get('epsilon', 0.2)
+                            beta = mtsd_cfg.get('beta', 0.0)
+                            mode = mtsd_cfg.get('mode', 'multiply')
                             w_t = torch.clamp(torch.exp(lam * delta_normalized), 1.0 - eps, 1.0 + eps)
 
-                            # Store for advantage reweighting (broadcast to token level)
-                            # w_t is per-step (bs,), broadcast across response tokens
-                            batch.batch["mtsd_weights"] = w_t.unsqueeze(-1).expand_as(response_mask) * response_mask
+                            # Store the per-step credit for the advantage step (broadcast to token level).
+                            # delta_normalized / w_t are per-step (bs,), broadcast across response tokens.
+                            if mode == 'additive':
+                                # Additive credit: A_t = A_outcome + beta * z_step, where
+                                # z_step = delta_normalized (already mean-0 within each trajectory,
+                                # so no extra centering). Stored under a DISTINCT key — the apply step
+                                # dispatches on which key is present, and HCAPO also writes
+                                # "mtsd_weights" and must keep the multiply path, so only this
+                                # additive run sets "mtsd_add".
+                                batch.batch["mtsd_add"] = (beta * delta_normalized).unsqueeze(-1).expand_as(response_mask) * response_mask
+                            else:
+                                # Multiplicative (default): A_t = A_outcome * w_t.
+                                batch.batch["mtsd_weights"] = w_t.unsqueeze(-1).expand_as(response_mask) * response_mask
 
                             # Log metrics
                             metrics.update({
@@ -1595,6 +1607,8 @@ class RayPPOTrainer:
                                 "mtsd/w_min": w_t.min().item(),
                                 "mtsd/w_max": w_t.max().item(),
                                 "mtsd/shuffle_delta": 1.0 if mtsd_cfg.get('shuffle_delta', False) else 0.0,
+                                "mtsd/mode_additive": 1.0 if mode == 'additive' else 0.0,
+                                "mtsd/beta": float(beta),
                             })
 
                     # HCAPO: hindsight teacher forward pass + ρ_t computation
@@ -1720,10 +1734,19 @@ class RayPPOTrainer:
                             vrc_predicates=vrc_predicates,
                         )
 
-                    # MTSD: multiply advantage by per-step weight w(Δ_t)
-                    # w_t > 0 always (exp + clip), so sign of A_grpo is never flipped
+                    # MTSD: apply per-step credit on top of the GRPO outcome advantage.
+                    # Two mutually-exclusive forms, dispatched purely by which key is present
+                    # (so the HCAPO path, which also writes mtsd_weights, always takes multiply):
+                    #   multiply (default): A_t = A_outcome * w_t, with w_t in [1-eps, 1+eps] > 0,
+                    #                       so the sign of A_grpo is never flipped.
+                    #   additive (mode=additive): A_t = A_outcome + beta * z_step. Here the per-token
+                    #                       sign CAN cross zero by design — that is how credit survives
+                    #                       all-fail groups, where A_outcome == 0 (0 * w stays dead,
+                    #                       but 0 + beta * z does not).
                     if "mtsd_weights" in batch.batch:
                         batch.batch["advantages"] = batch.batch["advantages"] * batch.batch["mtsd_weights"]
+                    if "mtsd_add" in batch.batch:
+                        batch.batch["advantages"] = batch.batch["advantages"] + batch.batch["mtsd_add"]
 
                     # Log VRC metrics if available
                     if hasattr(batch, 'vrc_metrics'):

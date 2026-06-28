@@ -149,9 +149,17 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, normalize_by_length=False)
+        # W10 random-reward testbed arm (Question A): randomize the TRAIN reward only.
+        # +algorithm.random_reward.enable=True [+algorithm.random_reward.p=<float|null>]
+        _rr = config.algorithm.get('random_reward', {})
+        _rr_enable = bool(_rr.get('enable', False)) if _rr is not None else False
+        _rr_p = _rr.get('p', None) if _rr is not None else None
+        reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, normalize_by_length=False,
+                                       random_reward=_rr_enable, random_reward_p=_rr_p)
 
-        # Note that we always use function-based RM for validation
+        # Note that we always use function-based RM for validation.
+        # Keep the TRUE reward here so the validation success rate stays an honest measurement
+        # of what the (randomly-rewarded) policy actually achieves.
         val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, normalize_by_length=False)
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)

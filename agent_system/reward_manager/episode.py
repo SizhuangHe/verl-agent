@@ -21,10 +21,19 @@ class EpisodeRewardManager:
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine, normalize_by_length=False) -> None:
+    def __init__(self, tokenizer, num_examine, normalize_by_length=False,
+                 random_reward=False, random_reward_p=None, random_reward_success_mag=10.0) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.normalize_by_length = normalize_by_length
+        # W10 random-reward testbed-health arm (Question A): when enabled, replace the real
+        # episode reward with a per-TRAJECTORY Bernoulli(p) * success_mag draw. This keeps the
+        # marginal win-rate (p) and reward scale (success_mag) identical to the real reward, but
+        # destroys the reward's correlation with the trajectory — so any learning under it is
+        # "improvement on noise", which is exactly what we want to test for.
+        self.random_reward = random_reward
+        self._random_reward_p = random_reward_p                 # None => measure base rate per batch
+        self._random_reward_success_mag = random_reward_success_mag  # ALFWorld success magnitude (10.0)
 
     def __call__(self, data: DataProto, return_dict=False):
         """We will expand this function gradually based on the available datasets"""
@@ -39,6 +48,25 @@ class EpisodeRewardManager:
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
         already_print_data_sources = {}
+
+        # Random-reward testbed arm: draw ONE random outcome per trajectory (NOT per step).
+        # Each row in `data` is one active step; a trajectory spans many rows that all carry
+        # the same real episode_rewards, so the random control must also be constant within a
+        # trajectory. We therefore key the draw on traj_uid and reuse it for every row of that
+        # trajectory below.
+        rr_draw = None
+        if self.random_reward:
+            traj_uids_all = np.asarray(data.non_tensor_batch['traj_uid'])
+            ep_rewards_all = np.asarray(data.non_tensor_batch['episode_rewards'], dtype=np.float32)
+            uniq_uids = np.unique(traj_uids_all)
+            # base success rate p: pinned by config if given, else measured over UNIQUE
+            # trajectories (per-row mean would be length-biased toward long trajectories).
+            p = self._random_reward_p
+            if p is None:
+                succ = [float(ep_rewards_all[traj_uids_all == u][0]) > 0 for u in uniq_uids]
+                p = float(np.mean(succ)) if len(succ) > 0 else 0.0
+            mag = float(self._random_reward_success_mag)
+            rr_draw = {u: (mag if (np.random.random() < p) else 0.0) for u in uniq_uids}
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
@@ -76,6 +104,9 @@ class EpisodeRewardManager:
                 score = episode_rewards / episode_lengths
             else:
                 score = episode_rewards
+            if rr_draw is not None:
+                # testbed arm: override with this trajectory's single random draw
+                score = rr_draw[data_item.non_tensor_batch['traj_uid']]
             reward_tensor[i, valid_response_length - 1] = torch.tensor(score, dtype=torch.float32, device=prompt_ids.device)
 
             if data_source not in already_print_data_sources:
